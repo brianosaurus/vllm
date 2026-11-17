@@ -29,7 +29,6 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-import vllm.envs as envs
 from vllm.compilation.breakable_cudagraph import (
     BreakableCUDAGraphWrapper,
     is_breakable_cudagraph_enabled,
@@ -57,6 +56,7 @@ from vllm.model_executor.layers.fused_moe.all2all_utils import get_ep_all2all_ma
 from vllm.model_executor.layers.mamba.ops.ssu_dispatch import (
     initialize_mamba_ssu_backend,
 )
+from vllm.model_executor.layers.quantization.input_quant_fp8 import padding_mask_scope
 from vllm.model_executor.layers.quantization.online.lm_head import (
     refresh_quantized_lm_heads,
 )
@@ -414,7 +414,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             logger.info_once("Loading model from scratch...")
 
             # Capture warmup providers selected while constructing the model.
-            with self.jit_warmup_registry.activate():
+            # The target model's dynamic per-tensor FP8 scales ignore padding rows.
+            # A draft model is loaded outside this scope: its batch has different
+            # rows, so it must not read this mask.
+            with (
+                self.jit_warmup_registry.activate(),
+                padding_mask_scope(self.input_buffers.is_padding),
+            ):
                 self.model = model or model_loader.load_model(
                     vllm_config=self.vllm_config,
                     model_config=self.vllm_config.model_config,
@@ -1477,9 +1483,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         num_tokens_after_padding = max(num_tokens, batch_desc.num_tokens)
         assert num_tokens > 0
         is_padding = self.input_buffers.is_padding[:num_tokens_after_padding]
-        if envs.VLLM_MOE_SKIP_PADDING:
-            is_padding[:num_tokens].fill_(False)
-            is_padding[num_tokens:].fill_(True)
+        is_padding[:num_tokens].fill_(False)
+        is_padding[num_tokens:].fill_(True)
 
         req_ids = batch_req_state.req_ids
         num_scheduled_tokens_np = batch_req_state.num_scheduled_tokens

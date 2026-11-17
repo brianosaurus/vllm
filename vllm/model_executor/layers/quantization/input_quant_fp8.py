@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import contextlib
+
 import torch
 import torch.nn.functional as F
 
@@ -23,6 +25,31 @@ from vllm.utils.deep_gemm import (
 _FP8_DTYPE = current_platform.fp8_dtype()
 _FP8_MIN, _FP8_MAX = get_fp8_min_max()
 _FP8_MIN_SCALING_FACTOR = 1.0 / (_FP8_MAX * 512.0)
+
+
+_PADDING_MASK_SCOPE: torch.Tensor | None = None
+
+
+@contextlib.contextmanager
+def padding_mask_scope(is_padding: torch.Tensor):
+    """Give the `QuantFP8` modules built in this scope a padding mask.
+
+    `is_padding` is a bool tensor, one entry per padded token row, that the model
+    runner refreshes in place every step (True marks a padding row). Dynamic
+    per-tensor FP8 scales then ignore those rows: a padded batch keeps whatever an
+    earlier step left in its padding rows, so a tensor-wide amax would let that
+    stale data set the scale for the real rows.
+
+    The mask is held as a module buffer, so `torch.compile` reads it as a graph
+    input and sees the runner's in-place updates; a global tensor would be baked in
+    as a constant.
+    """
+    global _PADDING_MASK_SCOPE
+    prev, _PADDING_MASK_SCOPE = _PADDING_MASK_SCOPE, is_padding
+    try:
+        yield
+    finally:
+        _PADDING_MASK_SCOPE = prev
 
 
 # --8<-- [start:quant_fp8]
@@ -69,6 +96,14 @@ class QuantFP8(CustomOp):
 
         self.use_aiter = rocm_aiter_ops.is_linear_fp8_enabled()
 
+        # None unless built inside padding_mask_scope; only the dynamic per-tensor
+        # scale reads it.
+        self.register_buffer(
+            "padding_mask",
+            _PADDING_MASK_SCOPE if not static else None,
+            persistent=False,
+        )
+
         self.is_group_quant = group_shape.is_per_group()
         if self.is_group_quant:
             self.group_size = group_shape.col
@@ -79,6 +114,18 @@ class QuantFP8(CustomOp):
                     "Only per-token or per-tensor scales are supported for dynamic "
                     "non-group quantization."
                 )
+
+    def _dynamic_per_tensor_scale(self, x: torch.Tensor) -> torch.Tensor:
+        """Dynamic per-tensor scale over the real rows of `x`."""
+        mask = self.padding_mask
+        if mask is None or x.dim() != 2 or mask.shape[0] < x.shape[0]:
+            x_max = x.abs().max().unsqueeze(-1).to(torch.float32)
+        else:
+            row_max = torch.linalg.vector_norm(
+                x, ord=float("inf"), dim=1, dtype=torch.float32
+            )
+            x_max = row_max.masked_fill(mask[: x.shape[0]], 0.0).max().unsqueeze(-1)
+        return (x_max / _FP8_MAX).clamp(min=_FP8_MIN_SCALING_FACTOR)
 
     def forward_cuda(
         self,
@@ -121,6 +168,12 @@ class QuantFP8(CustomOp):
             and self.group_shape == GroupShape.PER_TOKEN
             and scale_ub.numel() == 1
         )
+
+        if not self.static and self.group_shape == GroupShape.PER_TENSOR:
+            scale = self._dynamic_per_tensor_scale(x)
+            return ops.scaled_fp8_quant(
+                x, scale, num_token_padding=self.num_token_padding
+            )
 
         return ops.scaled_fp8_quant(
             x,
@@ -205,10 +258,9 @@ class QuantFP8(CustomOp):
                 x_max = x_max.unsqueeze(-1).to(torch.float32)
                 if scale_ub is not None:
                     x_max = x_max.clamp(max=scale_ub)
+                scale = (x_max / _FP8_MAX).clamp(min=_FP8_MIN_SCALING_FACTOR)
             else:
-                x_max = x.abs().max().unsqueeze(-1).to(torch.float32)
-
-            scale = (x_max / _FP8_MAX).clamp(min=_FP8_MIN_SCALING_FACTOR)
+                scale = self._dynamic_per_tensor_scale(x)
         else:
             scale = prep_scale_for_group_broadcast(scale, x, self.group_shape)
 
